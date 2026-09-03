@@ -1,0 +1,30 @@
+"""Base pipeline for studying how multi-agent deliberation changes identity bias in LLM judges.
+
+Public surface:
+    EvaluationItem, IdentityLabel        - the thing being judged + the demographic label
+    RunConfig, JudgeSpec, ScoreScale     - experiment configuration
+    run(), run_single_judge()            - top-level entry points
+    Panel, Judge                         - the machinery (subclass Panel to change the protocol)
+    JudgeEvaluation, RoundResult, PanelResult   - structured output
+    identity_bias_gap(), make_label_variants()  - the dependent variable
+"""
+
+from .config import RunConfig, JudgeSpec, ScoreScale, DEFAULT_MODEL
+from .data import EvaluationItem, IdentityLabel
+from .results import JudgeEvaluation, RoundResult, PanelResult
+from .judge import Judge
+from .panel import Panel
+from .pipeline import run, run_single_judge
+from .aggregate import AGGREGATORS, aggregate
+from .analysis import identity_bias_gap, BiasGap, make_label_variants
+from .client import get_client, MockAnthropic
+
+__all__ = [
+    "RunConfig", "JudgeSpec", "ScoreScale", "DEFAULT_MODEL",
+    "EvaluationItem", "IdentityLabel",
+    "JudgeEvaluation", "RoundResult", "PanelResult",
+    "Judge", "Panel", "run", "run_single_judge",
+    "AGGREGATORS", "aggregate",
+    "identity_bias_gap", "BiasGap", "make_label_variants",
+    "get_client", "MockAnthropic",
+]
