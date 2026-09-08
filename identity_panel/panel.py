@@ -19,6 +19,7 @@ from typing import Optional
 
 from . import prompts
 from .aggregate import aggregate
+from .bias import bias_trace_metadata
 from .config import RunConfig
 from .data import EvaluationItem
 from .judge import Judge
@@ -77,7 +78,7 @@ class Panel:
 
     def _config_dict(self) -> dict:
         c = self.config
-        return {
+        d = {
             "panel_size": c.panel_size,
             "discussion": c.discussion,
             "discussion_rounds": c.discussion_rounds,
@@ -87,3 +88,5 @@ class Panel:
             "show_peer_reasoning": c.show_peer_reasoning,
             "reveal_self_previous": c.reveal_self_previous,
         }
+        d.update(bias_trace_metadata(c))  # adds biased_judge_ids / bias_present; empty/False if none
+        return d
