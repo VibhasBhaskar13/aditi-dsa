@@ -7,6 +7,11 @@ Protocol implemented here (deliberately the simplest thing that covers H1-H3):
                    evaluations (anonymised) and optionally its own previous score
     group score    aggregate of the final round
 
+Turn order: with `config.sequential_turns=True` (default) judges speak one at a time in
+`config.judges` order within each discussion round, and each sees the latest opinion of
+every peer, so a judge who speaks first is seen (already updated) by everyone after it.
+With False all judges respond simultaneously and order does not matter.
+
 To change the deliberation protocol (e.g. only show the majority opinion, let
 judges see the running transcript, stop early on consensus), subclass Panel and
 override `_run_round` or `_peer_inputs`. Everything downstream (results,
@@ -50,7 +55,7 @@ class Panel:
                    prev: Optional[RoundResult]) -> RoundResult:
         evaluations: list[JudgeEvaluation] = []
         for judge in self.judges:
-            peer_block, self_prev = self._peer_inputs(judge, prev)
+            peer_block, self_prev = self._peer_inputs(judge, prev, evaluations)
             evaluations.append(judge.evaluate(
                 item, self.config.scale, round_index=round_index,
                 peer_block=peer_block, self_prev=self_prev,
@@ -59,11 +64,22 @@ class Panel:
                         [e.score for e in evaluations if e.ok])
         return RoundResult(round_index, evaluations, agg)
 
-    def _peer_inputs(self, judge: Judge, prev: Optional[RoundResult]):
-        """What `judge` gets to see from the previous round. `(None, None)` == independent."""
+    def _peer_inputs(self, judge: Judge, prev: Optional[RoundResult],
+                     current: Optional[list[JudgeEvaluation]] = None):
+        """What `judge` gets to see. `(None, None)` == independent.
+
+        `current` holds this round's evaluations so far (judges who already spoke).
+        Peers are listed in speaking order, each at their most recent valid opinion.
+        """
         if prev is None:
             return None, None
-        peers = [e for e in prev.evaluations if e.judge_id != judge.judge_id]
+        latest = {e.judge_id: e for e in prev.evaluations}
+        if self.config.sequential_turns and current:
+            for e in current:
+                if e.ok:
+                    latest[e.judge_id] = e
+        peers = [latest[j.judge_id] for j in self.judges
+                 if j.judge_id != judge.judge_id and j.judge_id in latest]
         block = prompts.format_peer_block(
             peers, show_reasoning=self.config.show_peer_reasoning
         )
@@ -87,6 +103,8 @@ class Panel:
             "models": [s.model for s in c.judges],
             "show_peer_reasoning": c.show_peer_reasoning,
             "reveal_self_previous": c.reveal_self_previous,
+            "sequential_turns": c.sequential_turns,
+            "judge_order": [s.judge_id for s in c.judges],
         }
         d.update(bias_trace_metadata(c))  # adds biased_judge_ids / bias_present; empty/False if none
         return d

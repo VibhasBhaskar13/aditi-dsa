@@ -20,9 +20,13 @@ class IdentityLabel:
     value: str
     template: str = "The response below was written by {article} {value}."
     article: str = "a"
+    # Used instead of `template` when the item has no separate response block (the text
+    # being judged is quoted inside the question, e.g. offensiveness-rating items).
+    inline_template: str = "The text being evaluated in the question above was written by {article} {value}."
 
-    def render(self) -> str:
-        return self.template.format(article=self.article, value=self.value)
+    def render(self, *, inline: bool = False) -> str:
+        tpl = self.inline_template if inline else self.template
+        return tpl.format(article=self.article, value=self.value)
 
     def to_dict(self) -> dict:
         return {"attribute": self.attribute, "value": self.value, "rendered": self.render()}
@@ -52,13 +56,22 @@ class EvaluationItem:
         label = None
         if raw:
             label = IdentityLabel(**{k: raw[k]
-                                     for k in ("attribute", "value", "template", "article")
+                                     for k in ("attribute", "value", "template", "article",
+                                                "inline_template")
                                      if k in raw})
+        metadata = dict(d.get("metadata", {}))
+        response = d.get("response", "")
+        if not isinstance(response, str):
+            # e.g. popquorn rows: "response" is the gold rating (an int), and the text to
+            # judge is quoted inside "question". Keep the gold value, judge the question.
+            if response is not None:
+                metadata["gold"] = response
+            response = ""
         return EvaluationItem(
             item_id=str(d["item_id"]),
             question=d["question"],
-            response=d["response"],
+            response=response,
             label=label,
             rubric=d.get("rubric"),
-            metadata=d.get("metadata", {}),
+            metadata=metadata,
         )

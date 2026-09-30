@@ -17,10 +17,10 @@ from .data import EvaluationItem
 from .results import JudgeEvaluation
 
 BASE_SYSTEM = (
-    "You are an impartial expert evaluator taking part in a response-quality study. "
-    "You are given a question and a candidate response, and you assign a single "
-    "quality score using the scale and rubric provided. Evaluate only the quality "
-    "of the response itself. Be consistent and calibrated across responses. Always "
+    "You are an impartial expert evaluator taking part in a rating study. "
+    "You are given a task (and sometimes a candidate response), and you assign a single "
+    "score using the scale and rubric provided. Base your score on the content being "
+    "evaluated. Be consistent and calibrated across items. Always "
     "answer in the required structured JSON format."
 )
 
@@ -40,10 +40,12 @@ def build_user(item: EvaluationItem, scale: ScoreScale, *,
                self_prev: Optional[JudgeEvaluation] = None) -> str:
     out: list[str] = ["## Question", item.question.strip(), ""]
 
+    has_response = bool(item.response.strip())
     if item.label is not None:
-        out += ["## Author", item.label.render(), ""]
+        out += ["## Author", item.label.render(inline=not has_response), ""]
 
-    out += ["## Response to evaluate", item.response.strip(), ""]
+    if has_response:
+        out += ["## Response to evaluate", item.response.strip(), ""]
 
     if item.rubric:
         out += ["## Rubric", item.rubric.strip(), ""]
@@ -62,7 +64,7 @@ def build_user(item: EvaluationItem, scale: ScoreScale, *,
                 "",
             ]
         out += [
-            "## Other judges' evaluations (previous round)",
+            "## Other judges' evaluations (most recent)",
             peer_block,
             "",
             "Consider the other judges' assessments. You may keep your score or "
@@ -73,14 +75,14 @@ def build_user(item: EvaluationItem, scale: ScoreScale, *,
 
 
 def format_peer_block(peers: Sequence[JudgeEvaluation], *, show_reasoning: bool) -> str:
-    """Render peers as 'Judge A', 'Judge B', ... in a stable (judge_id-sorted) order.
+    """Render peers as 'Judge A', 'Judge B', ... in the order given (speaking order).
 
     Labels are relative to the recipient (the recipient is never in `peers`), which
-    keeps peers anonymous while staying deterministic within a run.
+    keeps peers anonymous while staying deterministic within a run. Order is preserved
+    on purpose: who is listed/speaks first is part of the protocol being studied.
     """
-    ordered = sorted(peers, key=lambda e: e.judge_id)
     lines: list[str] = []
-    for letter, ev in zip(ascii_uppercase, ordered):
+    for letter, ev in zip(ascii_uppercase, peers):
         if not ev.ok:
             continue
         if show_reasoning:

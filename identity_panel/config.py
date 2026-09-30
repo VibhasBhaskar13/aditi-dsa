@@ -9,10 +9,13 @@ The three experimental arms from the proposal map onto three constructors:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-DEFAULT_MODEL = "claude-opus-5"
+# OpenRouter model slug ("vendor/model"). Override per run with --model, or globally
+# with the IDENTITY_PANEL_MODEL environment variable.
+DEFAULT_MODEL = os.environ.get("IDENTITY_PANEL_MODEL", "anthropic/claude-sonnet-4.5")
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,9 @@ class JudgeSpec:
     persona: Optional[str] = None      # optional extra system-prompt text for this seat
     max_tokens: int = 8000
     effort: Optional[str] = None       # None | "low" | "medium" | "high" | "xhigh" | "max"
+    temperature: Optional[float] = 0.0 # 0 for reproducibility; None = provider default.
+                                       # Ignored when `effort` (reasoning) is set.
+    bias_tag: Optional[str] = None     # set by identity_panel.bias for the biased seat
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,11 @@ class RunConfig:
     show_peer_reasoning: bool = True   # show peers' reasoning text (not just scores) in discussion
     reveal_self_previous: bool = True  # remind each judge of its own previous-round score
     mock_seed: Optional[int] = None    # only used by the offline MockAnthropic client
+    # Discussion turn order. True: judges speak one at a time in `judges` order, and each
+    # sees the *latest* opinion of every peer (this round's for judges who already spoke,
+    # last round's for the rest), so speaking first actually matters. False: all judges
+    # respond simultaneously to the previous round (order is irrelevant).
+    sequential_turns: bool = True
 
     def __post_init__(self) -> None:
         if not self.judges:

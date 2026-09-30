@@ -24,7 +24,7 @@ def score_schema(scale: ScoreScale) -> dict:
                 "type": "integer",
                 "minimum": scale.minimum,
                 "maximum": scale.maximum,
-                "description": f"Overall response-quality score. {scale.description}",
+                "description": f"Overall score. {scale.description}",
             },
             "reasoning": {
                 "type": "string",
@@ -65,6 +65,7 @@ class Judge:
                 system=system,
                 messages=[{"role": "user", "content": user}],
                 output_config=output_config,
+                temperature=self.spec.temperature,
             )
         except Exception as exc:  # noqa: BLE001 - record and keep the panel alive
             return self._fail(round_index, f"{type(exc).__name__}: {exc}")
