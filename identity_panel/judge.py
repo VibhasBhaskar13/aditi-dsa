@@ -66,6 +66,10 @@ class Judge:
                 messages=[{"role": "user", "content": user}],
                 output_config=output_config,
                 temperature=self.spec.temperature,
+                # Seat identity: lets CachedClient keep judges with identical prompts
+                # independent (each seat gets its own sample) while still sharing a seat's
+                # answer across experiment settings. Real clients ignore it.
+                cache_key=self.judge_id,
             )
         except Exception as exc:  # noqa: BLE001 - record and keep the panel alive
             return self._fail(round_index, f"{type(exc).__name__}: {exc}")

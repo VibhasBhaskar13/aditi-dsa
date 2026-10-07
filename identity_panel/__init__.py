@@ -11,7 +11,7 @@ Public surface:
     check_judge_bias()                   - verify the biased judge differs from a normal one
 """
 
-from .config import RunConfig, JudgeSpec, ScoreScale, DEFAULT_MODEL
+from .config import RunConfig, JudgeSpec, ScoreScale, DEFAULT_MODEL, DEFAULT_PROVIDER
 from .data import EvaluationItem, IdentityLabel
 from .results import JudgeEvaluation, RoundResult, PanelResult
 from .judge import Judge
@@ -19,18 +19,20 @@ from .panel import Panel
 from .pipeline import run, run_single_judge
 from .aggregate import AGGREGATORS, aggregate
 from .analysis import identity_bias_gap, BiasGap, make_label_variants
-from .client import get_client, MockAnthropic, OpenRouterClient
+from .client import (get_client, MockAnthropic, OpenRouterClient, GeminiClient,
+                     ChatCompletionsClient, CachedClient, DailyQuotaExhausted, DailyBudgetReached)
 from .bias import BiasSpec, biased_persona, make_panel_configs, BIAS_SETTINGS
 from .bias_check import check_judge_bias, BiasCheck
 
 __all__ = [
-    "RunConfig", "JudgeSpec", "ScoreScale", "DEFAULT_MODEL",
+    "RunConfig", "JudgeSpec", "ScoreScale", "DEFAULT_MODEL", "DEFAULT_PROVIDER",
     "EvaluationItem", "IdentityLabel",
     "JudgeEvaluation", "RoundResult", "PanelResult",
     "Judge", "Panel", "run", "run_single_judge",
     "AGGREGATORS", "aggregate",
     "identity_bias_gap", "BiasGap", "make_label_variants",
-    "get_client", "MockAnthropic", "OpenRouterClient",
+    "get_client", "MockAnthropic", "OpenRouterClient", "GeminiClient",
+    "ChatCompletionsClient", "CachedClient", "DailyQuotaExhausted", "DailyBudgetReached",
     "BiasSpec", "biased_persona", "make_panel_configs", "BIAS_SETTINGS",
     "check_judge_bias", "BiasCheck",
 ]

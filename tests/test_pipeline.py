@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -253,6 +254,318 @@ def test_experiment_csv_resume_and_early_stop(tmp_path, monkeypatch):
     rows = list(_csv.DictReader(open(tmp_path / "r.csv", encoding="utf-8-sig")))
     assert len(rows) == n * 3 * 2 and {"setting", "judge_id", "score", "reasoning", "is_biased"} <= set(rows[0])
     assert rx.main(args + ["--resume"]) == 0 and sum(1 for _ in out.open()) == n   # idempotent
+
+
+def test_openrouter_waits_and_retries_on_429(monkeypatch):
+    import identity_panel.client as cl
+    slept = []
+    monkeypatch.setattr(cl.time, "sleep", lambda w: slept.append(w))
+    sdk = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    real, n = sdk._create, {"k": 0}
+    RateLimitError = type("RateLimitError", (Exception,), {})
+    def flaky(**kw):
+        n["k"] += 1
+        if n["k"] <= 2: raise RateLimitError("429")
+        return real(**kw)
+    sdk.chat.completions.create = flaky
+    res = run_single_judge(ITEM, client=OpenRouterClient(sdk_client=sdk, rate_limit_waits=(7, 9)))
+    assert res.final_score == 3 and slept == [7, 9]
+    # once retries are exhausted the error is surfaced (judge records it, run is not silently wrong)
+    n["k"] = -99
+    res = run_single_judge(ITEM, client=OpenRouterClient(sdk_client=sdk, rate_limit_waits=(1,)))
+    assert res.rounds[0].evaluations[0].error.startswith("RateLimitError")
+
+
+# ---------------------------------------------------------------------------
+# Gemini provider, quota handling, cache
+# ---------------------------------------------------------------------------
+
+def _gem(sdk, **kw):
+    from identity_panel import GeminiClient
+    return GeminiClient(sdk_client=sdk, **kw)
+
+
+def test_gemini_request_shape():
+    sdk = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    cfg = RunConfig.single(model="gemini-3.1-flash-lite", effort="minimal")
+    run(ITEM, cfg, client=_gem(sdk))
+    kw = sdk.calls[0]
+    assert kw["model"] == "gemini-3.1-flash-lite"
+    assert kw["extra_body"] == {"reasoning_effort": "low"}   # "minimal" -> "low": safe on all Gemini models
+    assert "temperature" not in kw
+    assert "additionalProperties" not in json.dumps(kw["response_format"])
+    assert "additionalProperties" not in kw["messages"][0]["content"]
+
+
+def test_gemini3_skips_temperature_but_gemini25_sends_it():
+    sdk = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    run_single_judge(ITEM, model="gemini-3.1-flash-lite", client=_gem(sdk))
+    run_single_judge(ITEM, model="gemini-2.5-flash", client=_gem(sdk))
+    assert "temperature" not in sdk.calls[0] and sdk.calls[1]["temperature"] == 0.0
+
+
+def test_gemini_requires_key(monkeypatch):
+    from identity_panel import GeminiClient
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        GeminiClient()
+
+
+def _rl_sdk(msg, times, content='{"score": 3, "reasoning": "ok"}'):
+    sdk = _FakeSDK(content)
+    real, n = sdk._create, {"k": 0}
+    RateLimitError = type("RateLimitError", (Exception,), {})
+    def flaky(**kw):
+        n["k"] += 1
+        if n["k"] <= times:
+            raise RateLimitError(msg)
+        return real(**kw)
+    sdk.chat.completions.create = flaky
+    return sdk
+
+
+def test_429_uses_server_retry_hint(monkeypatch):
+    import identity_panel.client as cl
+    slept = []
+    monkeypatch.setattr(cl.time, "sleep", lambda w: slept.append(w))
+    sdk = _rl_sdk("Quota exceeded for requests per minute. Please retry in 12.5s", 1)
+    res = run_single_judge(ITEM, client=_gem(sdk))
+    assert res.final_score == 3 and slept == [13.5]          # hint + 1s, not the 15s default
+
+
+def test_daily_quota_is_not_retried(monkeypatch):
+    import identity_panel.client as cl
+    slept = []
+    monkeypatch.setattr(cl.time, "sleep", lambda w: slept.append(w))
+    sdk = _rl_sdk("GenerateRequestsPerDayPerProjectPerModel-FreeTier exceeded", 99)
+    res = run_single_judge(ITEM, client=_gem(sdk))
+    assert res.rounds[0].evaluations[0].error.startswith("DailyQuotaExhausted")
+    assert slept == []                                        # no wait loop
+
+
+def test_daily_budget_counts_and_persists(tmp_path):
+    from identity_panel import DailyBudgetReached
+    st = tmp_path / "q.json"
+    sdk = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    c = _gem(sdk, daily_budget=2, state_path=st)
+    c.messages.create(model="m", max_tokens=10, system="s", messages=[{"role": "user", "content": "a"}])
+    c.messages.create(model="m", max_tokens=10, system="s", messages=[{"role": "user", "content": "b"}])
+    with pytest.raises(DailyBudgetReached):
+        c.messages.create(model="m", max_tokens=10, system="s", messages=[{"role": "user", "content": "c"}])
+    c2 = _gem(sdk, daily_budget=2, state_path=st)            # a restart remembers today's count
+    assert c2.calls_today == 2
+
+
+def test_cache_skips_repeat_calls(tmp_path):
+    from identity_panel import CachedClient
+    sdk = _FakeSDK('{"score": 4, "reasoning": "ok"}')
+    c = CachedClient(_gem(sdk), tmp_path / "c.jsonl")
+    run_single_judge(ITEM, client=c); run_single_judge(ITEM, client=c)
+    assert len(sdk.calls) == 1 and c.hits == 1
+    c2 = CachedClient(_gem(_FakeSDK("x")), tmp_path / "c.jsonl")   # survives restart
+    assert run_single_judge(ITEM, client=c2).final_score == 4 and c2.hits == 1
+
+
+def test_cache_shares_normal_judges_across_settings(tmp_path):
+    from identity_panel import CachedClient
+    sdk = _FakeSDK('{"score": 4, "reasoning": "ok"}')
+    c = CachedClient(_gem(sdk), tmp_path / "c.jsonl")
+    cfgs = make_panel_configs(RunConfig.independent_panel(3, model="gemini-2.5-flash"), BIAS)
+    item = ITEM.with_label(make_label_variants(ITEM, "gender", ["woman"])[0].label)
+    run(item, cfgs["no_bias"], client=c)           # 3 calls: identical prompts, but each seat samples separately
+    assert len(sdk.calls) == 3
+    run(item, cfgs["bias_present"], client=c)      # judges 1,2 identical -> cached; only judge 3 new
+    assert len(sdk.calls) == 4 and c.hits == 2
+
+
+def test_script_stops_at_daily_budget_then_resumes(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rx2", Path(__file__).resolve().parents[1] / "scripts" / "run_experiment.py")
+    rx = importlib.util.module_from_spec(spec); spec.loader.exec_module(rx)
+    items = tmp_path / "i.jsonl"
+    items.write_text("\n".join('{"item_id": "q%d", "question": "rate: t%d", "response": 1}' % (i, i) for i in range(3)))
+    out = tmp_path / "r.jsonl"
+    sdk = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    monkeypatch.setattr(rx, "get_client", lambda **kw: _gem(sdk, daily_budget=kw["daily_budget"]))
+    base_args = ["--items", str(items), "--judges", "3", "--scale", "1,5", "--out", str(out),
+                 "--bias-setting", "no_bias", "--no-cache"]
+    assert rx.main(base_args + ["--daily-budget", "12", "--overwrite"]) == 2                  # 12 calls = 2 panel runs x... stops
+    done = sum(1 for _ in out.open())
+    assert 0 < done < 6 and len(sdk.calls) <= 12
+    sdk2 = _FakeSDK('{"score": 3, "reasoning": "ok"}')
+    monkeypatch.setattr(rx, "get_client", lambda **kw: _gem(sdk2))  # "next day", no cap
+    assert rx.main(base_args + ["--resume"]) == 0
+    assert sum(1 for _ in out.open()) == 6
+
+
+# ---------------------------------------------------------------------------
+# Kaggle runner: state survives sessions via a (fake, local) Hugging Face dataset
+# ---------------------------------------------------------------------------
+
+class _FakeHub:
+    """Stands in for HfApi: the 'remote repo' is a local folder."""
+    def __init__(self, root):
+        self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True); self.commits = 0
+    def create_repo(self, *a, **k): pass
+    def list_repo_files(self, repo, repo_type=None): return [p.name for p in self.root.iterdir()]
+    def hf_hub_download(self, repo, name, repo_type=None, local_dir=None):
+        import shutil; dst = Path(local_dir) / name; dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.root / name, dst); return str(dst)
+    def upload_folder(self, folder_path, repo_id, repo_type, allow_patterns, commit_message):
+        import shutil; self.commits += 1
+        for n in allow_patterns: shutil.copy(Path(folder_path) / n, self.root / n)
+
+
+def _load_kaggle_runner():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kr", Path(__file__).resolve().parents[1] / "scripts" / "kaggle_runner.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+
+def test_kaggle_runner_resumes_across_sessions(tmp_path, monkeypatch):
+    kr = _load_kaggle_runner()
+    hub = _FakeHub(tmp_path / "hub")
+    monkeypatch.setattr(kr, "get_secret", lambda n: "x")
+    items = tmp_path / "i.jsonl"
+    items.write_text("\n".join('{"item_id": "q%d", "question": "rate: text %d", "response": 1}' % (i, i) for i in range(4)))
+    base = ["--hf-repo", "u/r", "--dry-run", "--push-every", "60", "--entry", "run_experiment", "--", "--items", str(items),
+            "--bias-setting", "all", "--judges", "3", "--rounds", "1", "--scale", "1,5"]
+
+    def session(extra, tag):
+        wd = tmp_path / tag                       # a brand-new empty disk each session
+        return kr.main(["--workdir", str(wd), *base, *extra], api=hub), wd
+
+    code, wd1 = session(["--limit", "2"], "s1")
+    assert code == 0 and (hub.root / "results.jsonl").exists() and hub.commits == 1
+    n1 = sum(1 for _ in (hub.root / "results.jsonl").open())
+    assert n1 == 2 * 3 * 2                        # items x settings x labels
+    code, wd2 = session([], "s2")                 # new disk: must pull, then do ONLY the remaining items
+    assert code == 0
+    assert sum(1 for _ in (hub.root / "results.jsonl").open()) == 4 * 3 * 2
+    assert (wd2 / "results.jsonl").read_text().startswith((wd1 / "results.jsonl").read_text()[:200])  # kept old rows
+    c = hub.commits
+    code, _ = session([], "s3")                   # nothing left: no new commit, no duplicate rows
+    assert code == 0 and hub.commits == c and sum(1 for _ in (hub.root / "results.jsonl").open()) == 24
+
+
+def test_kaggle_notebook_is_valid():
+    import nbformat
+    nb = nbformat.read(str(Path(__file__).resolve().parents[1] / "scripts" / "kaggle_notebook.ipynb"), as_version=4)
+    nbformat.validate(nb)
+    assert any("kaggle_runner.py" in "".join(c.source) for c in nb.cells if c.cell_type == "code")
+
+
+# ---------------------------------------------------------------------------
+# The full suite: 3 tests / 8 conditions, random --n-scenarios, local model
+# ---------------------------------------------------------------------------
+
+def _load_script(name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+
+def _write_items(path, n):
+    path.write_text("\n".join(json.dumps({"item_id": f"q{i}", "response": 1,
+        "question": f"Evaluate and rank the following text for offensiveness on a scale of 1 to 5: text number {i}"})
+        for i in range(n)), encoding="utf-8")
+
+
+def _conds():
+    from identity_panel.suite import build_conditions
+    return {c.name: c for c in build_conditions(BiasSpec("gender", "woman", "man"), rounds=2)}
+
+
+def test_suite_has_exactly_the_requested_eight_conditions():
+    c = _conds()
+    assert list(c) == ["1_single", "1_indep_3", "1_delib_3", "1_indep_5", "1_delib_5",
+                       "2_biased_indep_5", "2_biased_delib_5", "3_biased_first_delib_5"]
+    shape = {n: (x.config.panel_size, x.config.discussion) for n, x in c.items()}
+    assert shape == {"1_single": (1, False), "1_indep_3": (3, False), "1_delib_3": (3, True),
+                     "1_indep_5": (5, False), "1_delib_5": (5, True), "2_biased_indep_5": (5, False),
+                     "2_biased_delib_5": (5, True), "3_biased_first_delib_5": (5, True)}
+    assert {n: x.test for n, x in c.items()} == {"1_single": 1, "1_indep_3": 1, "1_delib_3": 1, "1_indep_5": 1,
+        "1_delib_5": 1, "2_biased_indep_5": 2, "2_biased_delib_5": 2, "3_biased_first_delib_5": 3}
+    for n in ("1_single", "1_indep_3", "1_delib_3", "1_indep_5", "1_delib_5"):      # test 1: nobody biased
+        assert not any(j.bias_tag for j in c[n].config.judges)
+    for n in ("2_biased_indep_5", "2_biased_delib_5", "3_biased_first_delib_5"):    # tests 2-3: exactly one biased
+        assert sum(1 for j in c[n].config.judges if j.bias_tag) == 1
+    assert c["2_biased_delib_5"].config.judges[-1].bias_tag            # biased judge speaks last ...
+    assert c["3_biased_first_delib_5"].config.judges[0].bias_tag       # ... or first
+    personas = {j.persona for n in ("2_biased_indep_5", "2_biased_delib_5", "3_biased_first_delib_5")
+                for j in c[n].config.judges if j.bias_tag}
+    assert len(personas) == 1                                          # the SAME biased judge everywhere
+    assert c["1_delib_5"].config.judges[4].persona is None             # only difference 1_delib_5 -> 2_biased_delib_5
+
+
+def test_sampling_is_random_reproducible_and_nested():
+    from identity_panel.suite import sample_items
+    items = [EvaluationItem(f"q{i}", "q", "r") for i in range(200)]
+    a = [x.item_id for x in sample_items(items, 20, seed=1)]
+    assert a == [x.item_id for x in sample_items(items, 20, seed=1)]          # reproducible
+    assert a != [x.item_id for x in sample_items(items, 20, seed=2)]          # seed matters
+    assert a != [f"q{i}" for i in range(20)]                                  # not just the first 20
+    assert len(set(a)) == 20
+    assert [x.item_id for x in sample_items(items, 50, seed=1)][:20] == a     # nested: growing N keeps old picks
+    assert len(sample_items(items, None, 1)) == 200 and len(sample_items(items, 999, 1)) == 200
+
+
+def test_run_suite_writes_jsonl_for_every_condition_and_resumes(tmp_path):
+    rs = _load_script("run_suite")
+    items, out = tmp_path / "i.jsonl", tmp_path / "res" / "results.jsonl"
+    _write_items(items, 6)
+    base = ["--items", str(items), "--dry-run", "--seed", "3", "--out", str(out)]
+    assert rs.main([*base, "--n-scenarios", "2"]) == 0
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2 * 2 * 8                                            # scenarios x labels x conditions
+    assert {r["condition"] for r in rows} == set(_conds())
+    assert {r["label"]["value"] for r in rows} == {"woman", "man"}
+    assert all(r["gold"] == 1 and "rounds" in r and r["final_score"] == r["final_score"] for r in rows)
+    first_ids = {r["item_id"] for r in rows}
+    assert len(first_ids) == 2
+    assert rs.main([*base, "--n-scenarios", "2"]) == 0                       # resume: nothing new
+    assert sum(1 for _ in out.open(encoding="utf-8")) == len(rows)
+    assert rs.main([*base, "--n-scenarios", "3"]) == 0                       # bigger N: only the extra scenario
+    rows2 = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert len(rows2) == 3 * 2 * 8 and first_ids <= {r["item_id"] for r in rows2}
+    assert (tmp_path / "res" / "results_summary.csv").exists()
+    assert rs.main([*base, "--n-scenarios", "1", "--conditions", "1_single", "--overwrite"]) == 0
+    assert sum(1 for _ in out.open(encoding="utf-8")) == 2                   # --conditions / --overwrite
+
+
+def test_local_client_batches_concurrent_calls_and_parses_small_model_output():
+    import threading
+    from identity_panel.local_model import LocalHFClient, repair_json
+    from identity_panel.client import CachedClient
+    seen = []
+    def fake_generate(specs):                       # stands in for model.generate on a GPU
+        seen.append(len(specs))
+        return [' 4, "reasoning": "Mild language, fine."}' for _ in specs]
+    cli = LocalHFClient("fake", generate_fn=fake_generate, max_batch=8, max_wait=0.3)
+    out = []
+    def go(i):
+        it = EvaluationItem(f"b{i}", f"rate text {i}", "")
+        out.append(run(it, RunConfig.single(scale=ScoreScale(1, 5)), client=cli).final_score)
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    cli.close()
+    assert out == [4.0] * 8 and max(seen) > 1                       # 8 concurrent calls -> shared batch(es)
+    assert repair_json('{"score": 3, "reasoning": "cut off mid') and json.loads(repair_json('{"score": 3, "reasoning": "cut off mid'))["score"] == 3
+    assert json.loads(repair_json('{"score": 2'))["score"] == 2
+    assert repair_json("no json here") == "no json here"
+
+
+def test_kaggle_runner_runs_the_suite_across_sessions(tmp_path):
+    kr = _load_script("kaggle_runner")
+    hub = _FakeHub(tmp_path / "hub")
+    kr.get_secret = lambda n: "x"
+    items = tmp_path / "i.jsonl"; _write_items(items, 5)
+    base = ["--hf-repo", "u/r", "--dry-run", "--push-every", "60", "--", "--items", str(items), "--seed", "1"]
+    def session(n, tag):
+        return kr.main(["--workdir", str(tmp_path / tag), *base, "--n-scenarios", str(n)], api=hub)
+    assert session(1, "s1") == 0 and sum(1 for _ in (hub.root / "results.jsonl").open(encoding="utf-8")) == 1 * 2 * 8
+    assert session(2, "s2") == 0 and sum(1 for _ in (hub.root / "results.jsonl").open(encoding="utf-8")) == 2 * 2 * 8
 
 
 if __name__ == "__main__":

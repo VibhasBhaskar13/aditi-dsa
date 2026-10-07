@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Run the identity-bias judging pipeline over a file of items.
 
-Needs OPENROUTER_API_KEY for real runs (models are OpenRouter slugs, e.g.
-anthropic/claude-sonnet-4.5). --dry-run uses an offline mock: no key, no cost.
+Real runs use Gemini by default (GEMINI_API_KEY from https://aistudio.google.com/apikey;
+models like gemini-3.1-flash-lite). `--provider openrouter` uses OPENROUTER_API_KEY and
+slugs like anthropic/claude-sonnet-4.5. --dry-run uses an offline mock: no key, no cost.
+
+Free-tier friendly: set --rpm (your model's requests/minute from aistudio.google.com/rate-limit)
+and --daily-budget (a bit under its requests/day). Add --wait-for-reset to sleep until the
+Pacific-midnight quota reset and carry on by itself; or run daily from CI with --resume.
 
 Examples
 --------
@@ -39,13 +44,16 @@ import csv
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from identity_panel import (BIAS_SETTINGS, DEFAULT_MODEL, BiasSpec, EvaluationItem, RunConfig,
+from identity_panel import (BIAS_SETTINGS, DEFAULT_MODEL, DEFAULT_PROVIDER, BiasSpec, EvaluationItem, RunConfig,
                             ScoreScale, check_judge_bias, get_client, make_panel_configs, run)
 from identity_panel.analysis import make_label_variants
+from identity_panel.client import seconds_until_pt_reset
+from identity_panel.config import PROVIDER_DEFAULT_MODELS
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -62,8 +70,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--skip-bad-lines", action="store_true",
                    help="skip lines of --items that are not valid JSON instead of stopping")
     p.add_argument("--judges", type=int, default=1, help="panel size (1, 3, 5, ...)")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help="OpenRouter model slug for every judge seat")
+    p.add_argument("--provider", choices=["gemini", "openrouter"], default=DEFAULT_PROVIDER,
+                   help="API to use (default: %(default)s)")
+    p.add_argument("--model", default=None,
+                   help="model for every judge seat (default depends on --provider: "
+                        + ", ".join(f"{k}={v}" for k, v in PROVIDER_DEFAULT_MODELS.items()) + ")")
     p.add_argument("--models", default=None,
                    help="comma-separated model per seat; overrides --judges/--model count")
     p.add_argument("--discussion", action="store_true", help="enable discussion rounds")
@@ -71,8 +82,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="number of discussion rounds (>0 implies --discussion)")
     p.add_argument("--aggregate", default="mean", choices=["mean", "median", "majority"])
     p.add_argument("--effort", default=None,
-                   choices=["low", "medium", "high", "xhigh", "max"],
-                   help="reasoning effort per judge call (default: model default)")
+                   choices=["minimal", "low", "medium", "high", "xhigh", "max"],
+                   help="reasoning effort (Gemini: minimal/low = fastest) per judge call (default: model default)")
     p.add_argument("--scale", default="1,10", help="min,max integer score scale")
     p.add_argument("--scale-description", default=None,
                    help='what the scale means, e.g. "1 = least offensive, 5 = most offensive"')
@@ -107,8 +118,26 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true",
                    help="keep existing --out and skip (setting,item,label) combinations already done")
     p.add_argument("--overwrite", action="store_true", help="replace an existing --out")
-    p.add_argument("--min-interval", type=float, default=3.5,
-                   help="min seconds between API calls (free OpenRouter models: ~20 req/min)")
+    g2 = p.add_argument_group("rate / quota control")
+    g2.add_argument("--rpm", type=float, default=10.0,
+                    help="max requests per minute; calls are spaced 60/rpm s apart. Look up your "
+                         "model's number at aistudio.google.com/rate-limit (default: %(default)s)")
+    g2.add_argument("--min-interval", type=float, default=None,
+                    help="explicit seconds between calls (overrides --rpm)")
+    g2.add_argument("--daily-budget", type=int, default=None,
+                    help="max API calls per Pacific day (set a bit under your requests/day). "
+                         "Counted in --quota-state so restarts remember.")
+    g2.add_argument("--wait-for-reset", action="store_true",
+                    help="when the daily quota/budget is used up, sleep until midnight Pacific "
+                         "and continue (for a machine that stays on). Without it the run stops.")
+    g2.add_argument("--max-runtime-minutes", type=float, default=None,
+                    help="stop cleanly after this long (e.g. 330 for a 6 h CI job); exit code 0")
+    g2.add_argument("--quota-state", type=Path, default=None,
+                    help="JSON file with today's call count (default: <out>.quota.json)")
+    g2.add_argument("--cache", type=Path, default=None,
+                    help="JSONL cache of API answers; identical prompts are never re-sent "
+                         "(default: <out>.cache.jsonl)")
+    g2.add_argument("--no-cache", action="store_true", help="disable the answer cache")
     p.add_argument("--max-failures", type=int, default=5,
                    help="stop after this many consecutive failed runs (rate/daily limit hit); "
                         "rerun with --resume later")
@@ -189,6 +218,10 @@ def do_verify(a, bias: BiasSpec, items, client) -> int:
         print(f"  ERROR seen: {e}")
     for ex in chk.example_reasoning:
         print(f"  sample biased reasoning: {ex}")
+    if math.isnan(chk.separation):
+        print("INCONCLUSIVE: no successful API responses, so nothing was measured "
+              "(see ERROR above; rate limit / bad key / bad model slug). Retry later.")
+        return 2
     print("PASS" if chk.passed else "FAIL")
     return 0 if chk.passed else 1
 
@@ -285,12 +318,33 @@ def summarize(gaps: list[dict], a, values) -> None:
         print(f"mean final gap:     {sum(fin) / len(fin):+.3f}" if fin else "mean final gap: n/a")
 
 
+def _is_wall(errs) -> bool:
+    return any(("DailyQuotaExhausted" in e or "DailyBudgetReached" in e) for e in errs)
+
+
+def _terminal(errs) -> bool:
+    """Errors that retrying will not fix (the model refused / was safety-blocked)."""
+    return bool(errs) and all(e.startswith("refusal") for e in errs)
+
+
 def main(argv=None) -> int:
     a = parse_args(argv)
+    a.model = a.model or PROVIDER_DEFAULT_MODELS[a.provider]
+    if a.provider == "gemini" and "/" in a.model:
+        sys.exit(f"error: {a.model!r} looks like an OpenRouter slug; with --provider gemini use a "
+                 f"Gemini model id such as {PROVIDER_DEFAULT_MODELS['gemini']}")
     values = [v.strip() for v in a.values.split(",") if v.strip()]
     items = load_items(a.items, a.limit, a.skip_bad_lines)
-    client = get_client(dry_run=a.dry_run, mock_seed=a.mock_seed,
-                        min_interval=0.0 if a.dry_run else a.min_interval)
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    interval = 0.0 if a.dry_run else (a.min_interval if a.min_interval is not None
+                                      else 60.0 / a.rpm * 1.1)
+    client = get_client(dry_run=a.dry_run, mock_seed=a.mock_seed, min_interval=interval,
+                        provider=a.provider, daily_budget=a.daily_budget,
+                        state_path=None if a.dry_run else (a.quota_state or a.out.with_suffix(".quota.json")),
+                        cache_path=None if (a.dry_run or a.no_cache)
+                        else (a.cache or a.out.with_suffix(".cache.jsonl")))
+    started = time.monotonic()
+    deadline = started + a.max_runtime_minutes * 60 if a.max_runtime_minutes else None
 
     if a.verify_bias:
         return do_verify(a, build_bias(a, values), items, client)
@@ -321,17 +375,41 @@ def main(argv=None) -> int:
     todo_runs = sum(1 for it in items for st, _ in settings
                     for v in ([None] if a.include_control else []) + values
                     if (st, it.item_id, v) not in rows)
+    est_calls = todo_runs * calls_per_run
+    print(f"provider={a.provider} model={a.model}  effort={a.effort or 'default'}")
     print(f"{len(items)} items x {len(settings)} setting(s) x {n_labels} labels = {total_runs} panel runs "
           f"({len(rows)} already done, {todo_runs} to do)")
-    print(f"~{todo_runs * calls_per_run} API calls, at >= {0 if a.dry_run else a.min_interval}s each "
-          f"=> ~{todo_runs * calls_per_run * (0 if a.dry_run else a.min_interval) / 3600:.1f} h minimum")
+    print(f"<= {est_calls} API calls (fewer: cached answers are reused). Spacing {interval:.1f}s/call "
+          f"=> >= {est_calls * interval / 3600:.1f} h of waiting"
+          + (f"; daily budget {a.daily_budget} calls => ~{-(-est_calls // a.daily_budget)} day(s)"
+             if a.daily_budget else "; no --daily-budget set"))
     for st, cfg in settings:
         order = [f"{j.judge_id}{'*' if j.bias_tag else ''}" for j in cfg.judges]
         print(f"  [{st}] order={order} (*=biased) rounds={cfg.discussion_rounds} "
               f"aggregate={cfg.aggregate} model(s)={sorted({j.model for j in cfg.judges})}")
     print()
 
-    consecutive_fail, stopped = 0, False
+    state = dict(stopped=False, why="")
+
+    def stop(why):
+        state.update(stopped=True, why=why)
+
+    def wait_for_reset(reason) -> bool:
+        """Sleep to the Pacific-midnight reset. False => caller should stop instead."""
+        if not a.wait_for_reset:
+            return False
+        secs = seconds_until_pt_reset() + 120
+        print(f"[{reason}] sleeping {secs / 3600:.1f} h until the Pacific-midnight reset...", flush=True)
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if deadline and time.monotonic() >= deadline:
+                return False
+            time.sleep(min(60, max(0.0, end - time.monotonic())))
+        if hasattr(client, "reset_day"):
+            client.reset_day()
+        return True
+
+    consecutive_fail = 0
     mode = "a" if a.resume else "w"
     try:
         with a.out.open(mode, encoding="utf-8") as fh:
@@ -345,14 +423,36 @@ def main(argv=None) -> int:
                         val = v_item.label.value if v_item.label else None
                         if (setting, base_item.item_id, val) in rows:
                             continue
-                        res = run(v_item, config, client=client)
-                        errs = [e.error for rd in res.rounds for e in rd.evaluations if e.error]
+                        need = config.panel_size * (1 + config.discussion_rounds)
+                        while True:                       # retry this run after a quota wait
+                            if deadline and time.monotonic() >= deadline:
+                                stop("time limit (--max-runtime-minutes) reached")
+                                break
+                            budget = getattr(client, "daily_budget", None)
+                            if budget is not None and getattr(client, "calls_today", 0) + need > budget:
+                                if wait_for_reset("daily budget used"):
+                                    continue
+                                stop("daily budget used up (--daily-budget)")
+                                break
+                            res = run(v_item, config, client=client)
+                            errs = [e.error for rd in res.rounds for e in rd.evaluations if e.error]
+                            if _is_wall(errs):
+                                if wait_for_reset("daily quota exhausted"):
+                                    continue
+                                stop("daily quota exhausted")
+                            break
+                        if state["stopped"]:
+                            break
                         tag = f"[{setting or '-'}] [{base_item.item_id}] {val or '__control__':>10}"
-                        if errs or math.isnan(res.final_score):
+                        if errs and not _terminal(errs):
                             consecutive_fail += 1
-                            print(f"{tag}: FAILED ({len(errs)} errors, not saved; first: {errs[0] if errs else 'nan'})")
+                            print(f"{tag}: FAILED ({len(errs)} errors, not saved; first: {errs[0]})")
                             if consecutive_fail >= a.max_failures:
-                                stopped = True
+                                if all("RateLimitError" in e for e in errs) and wait_for_reset(
+                                        "repeated rate-limit errors"):
+                                    consecutive_fail = 0
+                                    continue
+                                stop(f"{consecutive_fail} consecutive failed runs (rate limit / bad key / model?)")
                                 break
                             continue
                         consecutive_fail = 0
@@ -362,15 +462,16 @@ def main(argv=None) -> int:
                         fh.write(json.dumps(row) + "\n")
                         fh.flush()
                         rows[_key(row)] = row
+                        note = "  (model refused/blocked; saved with error)" if errs else ""
                         print(f"{tag}: rounds={[round(x, 2) for x in res.per_round_scores]} "
-                              f"final={res.final_score:.2f}")
-                    if stopped:
+                              f"final={res.final_score:.2f}{note}")
+                    if state["stopped"]:
                         break
-                if stopped:
+                if state["stopped"]:
                     break
     except KeyboardInterrupt:
         print("\ninterrupted - saving what we have")
-        stopped = True
+        stop("interrupted")
     finally:
         n = write_raw_csv(rows, csv_out)
         gaps = compute_gaps(rows, values)
@@ -380,10 +481,12 @@ def main(argv=None) -> int:
     summarize(gaps, a, values)
     print(f"\nwrote {a.out} ({len(rows)} panel runs)\n      {csv_out} ({n} evaluation rows)"
           + (f"\n      {gaps_out}" if gaps else ""))
-    if stopped:
-        print(f"\nSTOPPED EARLY. Rerun the same command with --resume to continue "
-              f"(likely a rate/daily limit or bad key/model).")
-        return 2
+    hits = getattr(client, "hits", None)
+    if hits is not None:
+        print(f"cache hits (calls saved): {hits}; API calls today: {getattr(client, 'calls_today', '?')}")
+    if state["stopped"]:
+        print(f"\nSTOPPED: {state['why']}. Rerun the same command with --resume to continue.")
+        return 0 if state["why"].startswith("time limit") else 2
     return 0
 
 

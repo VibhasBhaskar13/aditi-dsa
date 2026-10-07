@@ -13,9 +13,18 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-# OpenRouter model slug ("vendor/model"). Override per run with --model, or globally
-# with the IDENTITY_PANEL_MODEL environment variable.
-DEFAULT_MODEL = os.environ.get("IDENTITY_PANEL_MODEL", "anthropic/claude-sonnet-4.5")
+# Which API serves the judges: "gemini" (Google AI Studio key) or "openrouter".
+# Override per run with --provider, or globally with IDENTITY_PANEL_PROVIDER.
+DEFAULT_PROVIDER = os.environ.get("IDENTITY_PANEL_PROVIDER", "gemini")
+
+# Default model per provider. Flash-Lite tier = cheapest / highest free throughput.
+# Override per run with --model, or globally with IDENTITY_PANEL_MODEL.
+PROVIDER_DEFAULT_MODELS = {
+    "gemini": "gemini-3.1-flash-lite",
+    "openrouter": "anthropic/claude-sonnet-4.5",
+}
+DEFAULT_MODEL = os.environ.get("IDENTITY_PANEL_MODEL",
+                               PROVIDER_DEFAULT_MODELS.get(DEFAULT_PROVIDER, "gemini-3.1-flash-lite"))
 
 
 @dataclass(frozen=True)
