@@ -17,10 +17,12 @@ Plus --hf-repo user/name (a dataset repo; created private if missing).
 Everything after `--` goes straight to the entry script (run_suite.py by default), e.g.
 
     python scripts/kaggle_runner.py --hf-repo me/identity-panel-results -- \
-        --items examples/popquorn.jsonl --n-scenarios 300 --seed 0 --model Qwen/Qwen2.5-7B-Instruct
+        --model Qwen/Qwen2.5-7B-Instruct --cases 0-2000
 
---out/--max-runtime-minutes (and --resume for run_experiment) are set for you.
-Run only ONE session at a time against the same HF repo, or they will overwrite each other.
+--out-dir/--max-runtime-minutes (and --out/--resume for run_experiment) are set for you.
+run_suite files are named after the model and case range (results_7b_cases_0-2000.*), and only
+those files are pulled/pushed, so several people can share one HF repo as long as no two
+sessions run the SAME model + case range at the same time.
 """
 
 from __future__ import annotations
@@ -36,13 +38,26 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))                    # run_experiment.py
 sys.path.insert(0, str(HERE.parent))             # identity_panel/
 
-# Files that make up "progress", per entry script (names follow each script's defaults for --out results.jsonl).
+# Files that make up "progress", per entry script. run_suite's names depend on --model/--cases
+# and are worked out at start-up (see suite_files); run_experiment uses fixed names.
 ENTRIES = {
-    "run_suite": dict(files=("results.jsonl", "results.cache.jsonl", "results_summary.csv"), resume_flag=False),
+    "run_suite": dict(files=None, resume_flag=False),
     "run_experiment": dict(files=("results.jsonl", "results.csv", "results_gaps.csv",
                                   "results.cache.jsonl", "results.quota.json"), resume_flag=True),
 }
 STATE_FILES = ENTRIES["run_experiment"]["files"]      # kept for older callers/tests
+
+
+def suite_files(script, rest, workdir: Path) -> tuple[list[str], list[str]]:
+    """(args, file names) for run_suite: the files belonging to this model + case range."""
+    from identity_panel.suite import load_items
+
+    args = [*rest, "--out-dir", str(workdir)]
+    a = script.parse_args(args)
+    items, _ = load_items(a.items)
+    n = max(it.metadata["case_index"] for it in items) + 1
+    _, _, out = script.resolve_paths(a, n)
+    return args, [f.name for f in script.output_files(out).values()]
 
 
 def get_secret(name: str):
@@ -156,20 +171,25 @@ def main(argv=None, api=None) -> int:
             sys.exit("error: GEMINI_API_KEY not found (Kaggle: Add-ons -> Secrets)")
         os.environ["GEMINI_API_KEY"] = key           # the client reads it from the environment
 
+    import importlib
+
     entry = ENTRIES[a.entry]
-    sync = HubSync(a.hf_repo, a.workdir, hf_token, api=api, files=entry["files"])
+    script = importlib.import_module(a.entry)
+    if a.entry == "run_suite":
+        args, files = suite_files(script, rest, a.workdir)
+        args += ["--max-runtime-minutes", str(a.max_runtime_minutes)]
+        print(f"this session's files: {', '.join(files)}")
+    else:
+        files = entry["files"]
+        args = [*rest, "--out", str(a.workdir / "results.jsonl"),
+                "--max-runtime-minutes", str(a.max_runtime_minutes)]
+    sync = HubSync(a.hf_repo, a.workdir, hf_token, api=api, files=files)
     sync.ensure_repo()
     if a.no_pull:
         a.workdir.mkdir(parents=True, exist_ok=True)
     else:
         print(f"pulled from hub: {sync.pull() or 'nothing yet (fresh start)'}")
 
-    import importlib
-
-    script = importlib.import_module(a.entry)
-
-    args = [*rest, "--out", str(a.workdir / "results.jsonl"),
-            "--max-runtime-minutes", str(a.max_runtime_minutes)]
     if entry["resume_flag"]:
         args.append("--resume")
     if a.dry_run:

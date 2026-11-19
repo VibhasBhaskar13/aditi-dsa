@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
+# Nouns used when a value is an adjective rather than a noun ("a non-binary person").
+_NOUNS = {"non-binary": "non-binary person"}
+
 
 @dataclass(frozen=True)
 class IdentityLabel:
@@ -23,13 +26,28 @@ class IdentityLabel:
     # Used instead of `template` when the item has no separate response block (the text
     # being judged is quoted inside the question, e.g. offensiveness-rating items).
     inline_template: str = "The text being evaluated in the question above was written by {article} {value}."
+    # Further facts about the author, shown after the main sentence, e.g.
+    # (("race", "White"), ("age", "35-39"), ...). Empty = only the main attribute is shown.
+    details: tuple = ()
 
     def render(self, *, inline: bool = False) -> str:
         tpl = self.inline_template if inline else self.template
-        return tpl.format(article=self.article, value=self.value)
+        text = tpl.format(article=self.article, value=_NOUNS.get(self.value, self.value))
+        if self.details:
+            text += " Other details about the author: " + "; ".join(
+                f"{k}: {v}" for k, v in self.details) + "."
+        return text
+
+    @property
+    def profile(self) -> dict:
+        """Every attribute of the author, main attribute first."""
+        return {self.attribute: self.value, **dict(self.details)}
 
     def to_dict(self) -> dict:
-        return {"attribute": self.attribute, "value": self.value, "rendered": self.render()}
+        d = {"attribute": self.attribute, "value": self.value, "rendered": self.render()}
+        if self.details:
+            d["profile"] = self.profile
+        return d
 
 
 @dataclass(frozen=True)

@@ -1,1 +1,8 @@
 anthropic>=1.0
+# local-model runs (Kaggle) and the Excel export
+pandas
+openpyxl
+# analysis/analysis.py
+numpy
+scipy
+matplotlib

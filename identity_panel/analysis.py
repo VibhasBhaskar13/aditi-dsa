@@ -19,6 +19,10 @@ def make_label_variants(item: EvaluationItem, attribute: str, values: Sequence[s
                         include_control: bool = False) -> list[EvaluationItem]:
     """Same question + response, one copy per identity value. Content is held constant."""
     kw = {"template": template} if template else {}
+    # If the item already carries a full author profile (popquorn_biases.jsonl), keep the
+    # other details and swap only this attribute, so the judge still sees every label.
+    if item.label is not None and item.label.attribute == attribute and item.label.details:
+        kw["details"] = item.label.details
     variants: list[EvaluationItem] = []
     if include_control:
         variants.append(item.with_label(None))

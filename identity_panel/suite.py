@@ -1,7 +1,9 @@
 """The full set of experiments, the random scenario sampler, and the summary statistics.
 
-Three tests, eight conditions. Every condition is run on the same scenarios, once per identity
-label (e.g. "woman" / "man"); the bias gap is score(woman) - score(man).
+Three tests, eight conditions. Every condition is run on the same scenarios. Each scenario is
+shown with ITS OWN author profile from popquorn_biases.jsonl (gender, race, age, occupation,
+education), so a scenario is judged once per condition. Bias is measured across scenarios:
+e.g. how far scores sit from the gold rating for women vs. men, and how a biased judge moves that.
 
   Test 1 - nobody is purposely biased
       1_single            1 judge
@@ -26,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import mean, stdev
@@ -107,17 +110,49 @@ def select_conditions(conditions: Sequence[Condition], names: Optional[str] = No
 # Scenarios: load popquorn.jsonl and pick a reproducible random subset         #
 # --------------------------------------------------------------------------- #
 
+# popquorn rows whose question contains unescaped double quotes are not valid JSON, but the
+# row layout is fixed, so they can still be read exactly.
+_POPQUORN_ROW = re.compile(r'^\{"item_id": "([^"]+)", "question": "(.*)", "response": (-?\d+)\}\s*$', re.DOTALL)
+
+
+def _recover_row(line: str) -> Optional[dict]:
+    m = _POPQUORN_ROW.match(line.strip())
+    if not m:
+        return None
+    try:   # undo ordinary JSON escapes (\n, \u00e9, ...); keep the stray quotes as-is
+        question = json.loads('"' + m.group(2).replace('\\"', '\u0022').replace('"', '\\"') + '"')
+    except ValueError:
+        question = m.group(2)
+    return {"item_id": m.group(1), "question": question, "response": int(m.group(3))}
+
+
 def load_items(path: Path) -> tuple[list[EvaluationItem], list[int]]:
-    """All valid items in the file, plus the 1-based numbers of lines that could not be read."""
+    """All items in the file, plus the 1-based numbers of lines that could not be read.
+
+    Each item's metadata["case_index"] is its 0-based row number in the file: case 0 is the
+    first row, case 1 the second, and so on. Rows with unescaped quotes are recovered."""
     items, bad = [], []
     for n, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip():
             continue
         try:
-            items.append(EvaluationItem.from_dict(json.loads(line)))
+            d = json.loads(line)
+        except ValueError:
+            d = _recover_row(line)
+        try:
+            if d is None:
+                raise ValueError("unreadable")
+            it = EvaluationItem.from_dict(d)
         except (ValueError, KeyError, TypeError):
             bad.append(n)
+            continue
+        items.append(replace(it, metadata={**it.metadata, "case_index": n - 1}))
     return items, bad
+
+
+def select_cases(items: Sequence[EvaluationItem], start: int, end: int) -> list[EvaluationItem]:
+    """Items whose case_index is in [start, end] (inclusive), in file order."""
+    return [it for it in items if start <= it.metadata.get("case_index", -1) <= end]
 
 
 def sample_items(items: Sequence[EvaluationItem], n: Optional[int], seed: int = 0) -> list[EvaluationItem]:
@@ -137,7 +172,8 @@ def sample_items(items: Sequence[EvaluationItem], n: Optional[int], seed: int = 
 # --------------------------------------------------------------------------- #
 
 def row_key(row: dict) -> tuple:
-    return (row["condition"], row["item_id"], (row.get("label") or {}).get("value"))
+    """One saved run per (condition, scenario): each scenario has exactly one author profile."""
+    return (row["condition"], row["item_id"])
 
 
 def load_rows(path: Path) -> list[dict]:
@@ -157,27 +193,58 @@ def load_rows(path: Path) -> list[dict]:
 # Summary: mean identity-bias gap per condition and round                      #
 # --------------------------------------------------------------------------- #
 
-def summarize(rows: Sequence[dict], values: Sequence[str]) -> list[dict]:
-    """One line per condition: n items, mean gap after each round, final gap with standard error."""
-    if len(values) != 2:
-        return []
-    a, b = values
+def row_profile(row: dict) -> dict:
+    """The author profile a saved run was judged with (gender from the label if no profile)."""
+    label = row.get("label") or {}
+    prof = dict(label.get("profile") or {})
+    if not prof and label.get("attribute"):
+        prof[label["attribute"]] = label.get("value")
+    return prof
+
+
+def _mean_se(xs):
+    xs = [x for x in xs if x == x]
+    if not xs:
+        return float("nan"), float("nan")
+    return mean(xs), (stdev(xs) / math.sqrt(len(xs)) if len(xs) > 1 else float("nan"))
+
+
+def summarize(rows: Sequence[dict], groups: Sequence[str] = ("woman", "man")) -> list[dict]:
+    """One line per condition: n scenarios, mean score after each round, mean final score,
+    mean (final score - gold), that error by gender, and the woman - man error gap.
+
+    Different scenarios carry different genders, so the gap compares score - gold (how much
+    more/less offensive than the reference rating a text is judged) across groups."""
+    a, b = groups
     by = {}
     for r in rows:
-        by.setdefault(r["condition"], {}).setdefault(r["item_id"], {})[(r.get("label") or {}).get("value")] = r
+        by.setdefault(r["condition"], {})[r["item_id"]] = r      # last write wins
     out = []
     for cond, items in by.items():
-        pairs = [(v[a], v[b]) for v in items.values() if a in v and b in v]
-        if not pairs:
+        rs = [r for r in items.values() if r.get("final_score") == r.get("final_score")]
+        if not rs:
             continue
-        n_rounds = min(min(len(x["per_round_scores"]), len(y["per_round_scores"])) for x, y in pairs)
-        per_round = [mean(x["per_round_scores"][i] - y["per_round_scores"][i] for x, y in pairs)
-                     for i in range(n_rounds)]
-        finals = [x["final_score"] - y["final_score"] for x, y in pairs]
-        se = stdev(finals) / math.sqrt(len(finals)) if len(finals) > 1 else float("nan")
-        out.append({"condition": cond, "test": pairs[0][0].get("test"), "n_items": len(pairs),
-                    "mean_score_" + a: mean(x["final_score"] for x, _ in pairs),
-                    "mean_score_" + b: mean(y["final_score"] for _, y in pairs),
-                    "gap_per_round": per_round, "final_gap": mean(finals), "final_gap_se": se})
+        n_rounds = min(len(r["per_round_scores"]) for r in rs)
+        err = {}
+        for r in rs:
+            g = r.get("gold")
+            if isinstance(g, (int, float)):
+                err.setdefault(str(row_profile(r).get("gender", "")).lower(), []).append(r["final_score"] - g)
+        all_err = [x for xs in err.values() for x in xs]
+        gap = gap_se = float("nan")
+        if err.get(a) and err.get(b):
+            ma, sa = _mean_se(err[a]); mb, sb = _mean_se(err[b])
+            gap = ma - mb
+            gap_se = math.sqrt(sa ** 2 + sb ** 2) if sa == sa and sb == sb else float("nan")
+        d = {"condition": cond, "test": rs[0].get("test"), "n_items": len(rs),
+             "mean_score_per_round": [mean(r["per_round_scores"][i] for r in rs) for i in range(n_rounds)],
+             "mean_final_score": mean(r["final_score"] for r in rs),
+             "mean_score_minus_gold": _mean_se(all_err)[0]}
+        for g in sorted(err):
+            d[f"n_{g}"] = len(err[g])
+            d[f"score_minus_gold_{g}"] = mean(err[g])
+        d[f"gap_{a}_minus_{b}"] = gap
+        d[f"gap_{a}_minus_{b}_se"] = gap_se
+        out.append(d)
     out.sort(key=lambda d: d["condition"])
     return out

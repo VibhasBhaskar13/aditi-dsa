@@ -470,6 +470,10 @@ def _write_items(path, n):
     path.write_text("\n".join(json.dumps({"item_id": f"q{i}", "response": 1,
         "question": f"Evaluate and rank the following text for offensiveness on a scale of 1 to 5: text number {i}"})
         for i in range(n)), encoding="utf-8")
+    genders = ["Woman", "Man", "Non-binary"]
+    (path.parent / "popquorn_biases.jsonl").write_text("\n".join(json.dumps({
+        "item_id": f"q{i}", "gender": genders[i % 3], "race": "White", "age": "35-39",
+        "occupation": "Employed", "education": "College degree"}) for i in range(n)), encoding="utf-8")
 
 
 def _conds():
@@ -511,27 +515,59 @@ def test_sampling_is_random_reproducible_and_nested():
     assert len(sample_items(items, None, 1)) == 200 and len(sample_items(items, 999, 1)) == 200
 
 
-def test_run_suite_writes_jsonl_for_every_condition_and_resumes(tmp_path):
+def test_run_suite_ranges_profiles_excel_and_resume(tmp_path):
     rs = _load_script("run_suite")
-    items, out = tmp_path / "i.jsonl", tmp_path / "res" / "results.jsonl"
+    items = tmp_path / "i.jsonl"
     _write_items(items, 6)
-    base = ["--items", str(items), "--dry-run", "--seed", "3", "--out", str(out)]
-    assert rs.main([*base, "--n-scenarios", "2"]) == 0
+    base = ["--items", str(items), "--dry-run", "--out-dir", str(tmp_path / "res"),
+            "--model", "Qwen/Qwen2.5-3B-Instruct"]
+    out = tmp_path / "res" / "results_3b_cases_1-3.jsonl"                     # named after model + range
+    assert rs.main([*base, "--cases", "1-3"]) == 0
     rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 2 * 2 * 8                                            # scenarios x labels x conditions
+    assert len(rows) == 3 * 8                                                # one run per case x condition
+    assert {r["case_index"] for r in rows} == {1, 2, 3}                      # 0-based rows, both ends included
     assert {r["condition"] for r in rows} == set(_conds())
-    assert {r["label"]["value"] for r in rows} == {"woman", "man"}
-    assert all(r["gold"] == 1 and "rounds" in r and r["final_score"] == r["final_score"] for r in rows)
-    first_ids = {r["item_id"] for r in rows}
-    assert len(first_ids) == 2
-    assert rs.main([*base, "--n-scenarios", "2"]) == 0                       # resume: nothing new
-    assert sum(1 for _ in out.open(encoding="utf-8")) == len(rows)
-    assert rs.main([*base, "--n-scenarios", "3"]) == 0                       # bigger N: only the extra scenario
+    assert all(r["model_size"] == "3B" and r["gold"] == 1 for r in rows)
+    r = next(r for r in rows if r["case_index"] == 2)
+    assert r["label"]["value"] == "non-binary"                               # every label is shown ...
+    assert r["label"]["profile"]["education"] == "College degree"
+    assert "race: White" in r["label"]["rendered"] and "non-binary person" in r["label"]["rendered"]
+    assert all(e["reasoning"] for rd in r["rounds"] for e in rd["evaluations"])   # ... and reasoning is kept
+    import pandas as pd
+    xl = pd.ExcelFile(out.with_suffix(".xlsx"))
+    assert {"runs", "judge_evaluations", "summary", "info"} <= set(xl.sheet_names)
+    runs = pd.read_excel(xl, "runs")
+    assert set(runs["model_size"]) == {"3B"} and set(runs["model"]) == {"Qwen/Qwen2.5-3B-Instruct"}
+    assert "reasoning" in pd.read_excel(xl, "judge_evaluations").columns
+    # a session cut short: drop the last case's runs, rerun -> only those are redone
+    lines = out.read_text(encoding="utf-8").splitlines()
+    keep = [l for l in lines if json.loads(l)["case_index"] != 3]
+    out.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    assert rs.main([*base, "--cases", "1-3"]) == 0
     rows2 = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
-    assert len(rows2) == 3 * 2 * 8 and first_ids <= {r["item_id"] for r in rows2}
-    assert (tmp_path / "res" / "results_summary.csv").exists()
-    assert rs.main([*base, "--n-scenarios", "1", "--conditions", "1_single", "--overwrite"]) == 0
-    assert sum(1 for _ in out.open(encoding="utf-8")) == 2                   # --conditions / --overwrite
+    assert len(rows2) == 24 and len({(x["condition"], x["item_id"]) for x in rows2}) == 24
+    # another person / model: separate file, nothing shared
+    assert rs.main([*base[:-1], "Qwen/Qwen2.5-7B-Instruct", "--cases", "4-5"]) == 0
+    assert (tmp_path / "res" / "results_7b_cases_4-5.jsonl").exists()
+    assert rs.main([*base, "--cases", "1-3", "--conditions", "1_single", "--overwrite"]) == 0
+    assert sum(1 for _ in out.open(encoding="utf-8")) == 3                   # --conditions / --overwrite
+
+
+def test_case_ranges_and_unescaped_quotes(tmp_path):
+    from identity_panel.demographics import parse_cases, model_size_tag
+    from identity_panel.suite import load_items
+    assert parse_cases("0-2000", 13036) == (0, 2000) and parse_cases(None, 10) == (0, 9)
+    assert parse_cases("5", 10) == (5, 5) and parse_cases("8-50", 10) == (8, 9)
+    for bad in ("3-1", "x", "20-30"):
+        with pytest.raises(ValueError):
+            parse_cases(bad, 10)
+    assert model_size_tag("Qwen/Qwen2.5-7B-Instruct") == "7B" and model_size_tag("Qwen/Qwen2.5-3B-Instruct") == "3B"
+    f = tmp_path / "p.jsonl"
+    f.write_text('{"item_id": "q1", "question": "plain", "response": 1}\n'
+                 '{"item_id": "q2", "question": "he said "hi" to me\\nok", "response": 4}\n', encoding="utf-8")
+    items, bad = load_items(f)
+    assert not bad and [i.metadata["case_index"] for i in items] == [0, 1]
+    assert items[1].question == 'he said "hi" to me\nok' and items[1].metadata["gold"] == 4
 
 
 def test_local_client_batches_concurrent_calls_and_parses_small_model_output():
@@ -561,11 +597,20 @@ def test_kaggle_runner_runs_the_suite_across_sessions(tmp_path):
     hub = _FakeHub(tmp_path / "hub")
     kr.get_secret = lambda n: "x"
     items = tmp_path / "i.jsonl"; _write_items(items, 5)
-    base = ["--hf-repo", "u/r", "--dry-run", "--push-every", "60", "--", "--items", str(items), "--seed", "1"]
-    def session(n, tag):
-        return kr.main(["--workdir", str(tmp_path / tag), *base, "--n-scenarios", str(n)], api=hub)
-    assert session(1, "s1") == 0 and sum(1 for _ in (hub.root / "results.jsonl").open(encoding="utf-8")) == 1 * 2 * 8
-    assert session(2, "s2") == 0 and sum(1 for _ in (hub.root / "results.jsonl").open(encoding="utf-8")) == 2 * 2 * 8
+    base = ["--hf-repo", "u/r", "--dry-run", "--push-every", "60", "--", "--items", str(items)]
+    def session(tag, model, cases, minutes=None):
+        extra = ["--max-runtime-minutes", str(minutes)] if minutes is not None else []
+        return kr.main(["--workdir", str(tmp_path / tag), *extra, *base, "--model", model, "--cases", cases], api=hub)
+    f3 = hub.root / "results_3b_cases_0-4.jsonl"
+    assert session("s1", "Qwen/Qwen2.5-3B-Instruct", "0-4") == 0
+    lines = f3.read_text(encoding="utf-8").splitlines()
+    f3.write_text("\n".join(lines[:15]) + "\n", encoding="utf-8")              # pretend session 1 was cut off
+    assert session("s2", "Qwen/Qwen2.5-3B-Instruct", "0-4") == 0                  # fresh machine: pulls, resumes
+    assert sum(1 for _ in f3.open(encoding="utf-8")) == 5 * 8
+    assert (hub.root / "results_3b_cases_0-4.xlsx").exists()
+    assert session("s3", "Qwen/Qwen2.5-7B-Instruct", "0-1") == 0                  # teammate, same repo
+    assert sum(1 for _ in (hub.root / "results_7b_cases_0-1.jsonl").open(encoding="utf-8")) == 2 * 8
+    assert sum(1 for _ in f3.open(encoding="utf-8")) == 5 * 8                     # untouched
 
 
 if __name__ == "__main__":
